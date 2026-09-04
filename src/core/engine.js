@@ -64,6 +64,8 @@ export class Engine {
     this._accum = 0;
     this._last = 0;
     this._running = false;
+    this._readyPromise = null;
+    this._initializedSystems = new Set();
     this._onResize = () => this.resize();
   }
 
@@ -72,17 +74,69 @@ export class Engine {
     return this;
   }
 
-  async init() {
+  async init({ progressive = false } = {}) {
     const order = this.registry.resolve();
-    for (const sys of order) {
+
+    // Fast first paint optimization:
+    // Initialize RenderSystem first so the canvas gets painted on frame 0
+    const renderSys = order.find((s) => s.constructor.id === 'render');
+    if (renderSys) {
       const t0 = performance.now();
-      await sys.init?.(this.ctx);
+      await renderSys.init?.(this.ctx);
+      this._initializedSystems.add(renderSys);
       const ms = performance.now() - t0;
-      if (ms > 50) console.info(`[engine] ${sys.constructor.id} init ${ms.toFixed(0)}ms`);
+      if (ms > 50) console.info(`[engine] render init ${ms.toFixed(0)}ms`);
+      if (typeof renderSys.paintInitialFrame === 'function') {
+        renderSys.paintInitialFrame();
+      }
     }
+
     this.input.attach();
     addEventListener('resize', this._onResize);
     this.resize();
+
+    if (progressive) {
+      this._readyPromise = (async () => {
+        for (const sys of order) {
+          if (sys === renderSys) continue;
+          const t0 = performance.now();
+          await sys.init?.(this.ctx);
+          this._initializedSystems.add(sys);
+          const w = Math.max(1, this.canvas.clientWidth || innerWidth);
+          const h = Math.max(1, this.canvas.clientHeight || innerHeight);
+          if (typeof sys.resize === 'function') {
+            try {
+              sys.resize(w, h, this.ctx);
+            } catch (err) {
+              console.warn(`[engine] resize error on ${sys.constructor.id}:`, err);
+            }
+          }
+          const ms = performance.now() - t0;
+          if (ms > 50) console.info(`[engine] ${sys.constructor.id} init ${ms.toFixed(0)}ms`);
+          // Yield to browser frame so subsequent renders paint smoothly
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        this.events.emit('engine:ready');
+        return this;
+      })();
+      return this;
+    }
+
+    for (const sys of order) {
+      if (sys === renderSys) continue;
+      const t0 = performance.now();
+      await sys.init?.(this.ctx);
+      this._initializedSystems.add(sys);
+      const ms = performance.now() - t0;
+      if (ms > 50) console.info(`[engine] ${sys.constructor.id} init ${ms.toFixed(0)}ms`);
+    }
+    return this;
+  }
+
+  async whenReady() {
+    if (this._readyPromise) {
+      await this._readyPromise;
+    }
     return this;
   }
 
@@ -93,7 +147,15 @@ export class Engine {
     this.camera.updateProjectionMatrix();
     this.viewCamera.aspect = w / h;
     this.viewCamera.updateProjectionMatrix();
-    for (const sys of this.registry.with('resize')) sys.resize(w, h, this.ctx);
+    for (const sys of this.registry.with('resize')) {
+      if (this._initializedSystems.has(sys)) {
+        try {
+          sys.resize(w, h, this.ctx);
+        } catch (err) {
+          console.warn(`[engine] resize error in ${sys.constructor?.id}:`, err);
+        }
+      }
+    }
     this.events.emit('resize', { width: w, height: h });
   }
 
@@ -132,18 +194,26 @@ export class Engine {
     let steps = 0;
     const fixedSystems = this.registry.with('fixedUpdate');
     while (this._accum >= FIXED_DT && steps < MAX_SUBSTEPS) {
-      for (const sys of fixedSystems) sys.fixedUpdate(FIXED_DT, this.ctx);
+      for (const sys of fixedSystems) {
+        if (this._initializedSystems.has(sys)) sys.fixedUpdate(FIXED_DT, this.ctx);
+      }
       this._accum -= FIXED_DT;
       steps++;
     }
     if (steps === MAX_SUBSTEPS) this._accum = 0; // shed backlog rather than spiral
     t.alpha = this._accum / FIXED_DT;
 
-    for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
-    for (const sys of this.registry.with('lateUpdate')) sys.lateUpdate(t.dt, this.ctx);
+    for (const sys of this.registry.with('update')) {
+      if (this._initializedSystems.has(sys)) sys.update(t.dt, this.ctx);
+    }
+    for (const sys of this.registry.with('lateUpdate')) {
+      if (this._initializedSystems.has(sys)) sys.lateUpdate(t.dt, this.ctx);
+    }
 
     const renderSystem = this.registry.peek('render');
-    if (typeof renderSystem?.render === 'function') renderSystem.render(this.ctx);
+    if (this._initializedSystems.has(renderSystem) && typeof renderSystem?.render === 'function') {
+      renderSystem.render(this.ctx);
+    }
 
     this.input.endFrame();
   }
@@ -153,6 +223,7 @@ export class Engine {
     removeEventListener('resize', this._onResize);
     this.input.detach();
     for (const sys of [...this.registry.ordered].reverse()) sys.dispose?.();
+    this._initializedSystems.clear();
     this.events.clear();
   }
 }

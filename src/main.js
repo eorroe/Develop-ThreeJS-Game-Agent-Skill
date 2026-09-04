@@ -23,6 +23,7 @@ const capture = params.get('capture') === '1';
 // because tools that measure real frame pacing (tools/perf.mjs) need the loop to
 // free-run. See the long comment in src/dev/shots.js.
 const lockstep = capture && params.get('lockstep') === '1';
+const progressive = !capture && !lockstep;
 
 const config = createConfig({
   quality: params.get('q') ?? 'ultra',
@@ -48,7 +49,9 @@ engine
   .add(AudioSystem);
 
 try {
-  await engine.init();
+  // In interactive mode, progressive initialization paints the 1st frame to canvas
+  // in <16-30ms instead of waiting for full world & BVH tree construction.
+  await engine.init({ progressive });
 } catch (err) {
   console.error('[boot] init failed', err);
   document.body.insertAdjacentHTML(
@@ -62,25 +65,30 @@ BOOT FAILURE\n\n${err.stack ?? err.message}</pre>`
 
 const shotApi = installShotApi(engine, { capture, lockstep });
 
-// Compile every shader permutation before the frame loop starts. Measured: without
-// this, 86 programs compile lazily during play, up to 30 on one frame, producing
-// 3.1-3.9 SECOND stalls. See src/core/prewarm.js.
-//
-// ON BY DEFAULT since the capture path was made frame-deterministic; opt out with
-// `?prewarm=0`. It is now PROVEN pixel-neutral: `tools/baseline.mjs` with
-// `--query=prewarm=0` vs `--query=prewarm=1` reports identical:true on all 11
-// shots (0 changed pixels, maxDelta 0). The two things that previously made the
-// ~1.4 s pre-warm spend look like a visual change were both boot-duration
-// couplings OUTSIDE the subsystems: (1) the shutter frame index was latency-bound
-// because the engine kept stepping through the driver's round trips — fixed by
-// lockstep in src/dev/shots.js; (2) `will-change: transform` on the compass strip
-// cached a composited-layer raster taken at a wall-clock-dependent moment — fixed
-// in src/ui/style.js.
-const warmup = params.get('prewarm') === '0' ? { ok: false, reason: 'disabled by ?prewarm=0' } : await prewarm(engine);
-console.info('[boot] prewarm', warmup);
-window.__PREWARM__ = warmup;
-
+// Start the engine loop immediately so canvas paints from frame 0
 engine.start();
+
+// Prewarm shaders: in capture/lockstep mode, await readiness and warmup synchronously for
+// deterministic pixel testing. In interactive mode, warm shaders lazily in the background
+// without blocking initial gameplay paints.
+let warmupPromise = null;
+if (params.get('prewarm') === '0') {
+  window.__PREWARM__ = { ok: false, reason: 'disabled by ?prewarm=0' };
+} else if (capture || lockstep) {
+  await engine.whenReady();
+  const warmup = await prewarm(engine);
+  console.info('[boot] prewarm', warmup);
+  window.__PREWARM__ = warmup;
+} else {
+  warmupPromise = engine.whenReady().then(async () => {
+    const warmup = await prewarm(engine);
+    console.info('[boot] lazy prewarm complete', warmup);
+    window.__PREWARM__ = warmup;
+    return warmup;
+  }).catch((err) => {
+    console.warn('[boot] lazy prewarm error', err);
+  });
+}
 
 // Capture harness handshake: only flag ready once a frame has actually landed.
 //
@@ -90,8 +98,21 @@ engine.start();
 // matter how long boot (or pre-warm) took in wall-clock terms.
 const BOOT_FRAMES = 3;
 if (lockstep) {
+  await engine.whenReady();
   await shotApi.pump(BOOT_FRAMES);
   window.__READY__ = true;
+} else if (capture) {
+  await engine.whenReady();
+  if (warmupPromise) await warmupPromise;
+  let warm = 0;
+  const readyProbe = () => {
+    if (++warm >= BOOT_FRAMES) {
+      window.__READY__ = true;
+      return;
+    }
+    requestAnimationFrame(readyProbe);
+  };
+  requestAnimationFrame(readyProbe);
 } else {
   let warm = 0;
   const readyProbe = () => {
