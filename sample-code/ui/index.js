@@ -585,29 +585,30 @@ export class UiSystem {
     this.vw = w;
     this.vh = h;
     this.k = clamp(h / 1080, 0.62, 2.4);
+    if (!this.root) return;
     this.root.style.setProperty('--k', this.k.toFixed(4));
-    this.crosshair.setScale(this.k);
-    this.compass.setScale(this.k);
-    this.minimap.resize(this.k);
+    this.crosshair?.setScale(this.k);
+    this.compass?.setScale(this.k);
+    this.minimap?.resize(this.k);
   }
 
   dispose() {
     for (const off of this._unsubs) off();
     this._unsubs.length = 0;
-    this.crosshair.dispose();
-    this.hit.dispose();
-    this.arcs.dispose();
-    this.health.dispose();
-    this.ammo.dispose();
-    this.killfeed.dispose();
-    this.compass.dispose();
-    this.matchBar.dispose();
-    this.minimap.dispose();
-    this.markers.dispose();
-    this.prompt.dispose();
-    this.banner.dispose();
-    this.menu.dispose();
-    this.root.remove();
+    this.crosshair?.dispose();
+    this.hit?.dispose();
+    this.arcs?.dispose();
+    this.health?.dispose();
+    this.ammo?.dispose();
+    this.killfeed?.dispose();
+    this.compass?.dispose();
+    this.matchBar?.dispose();
+    this.minimap?.dispose();
+    this.markers?.dispose();
+    this.prompt?.dispose();
+    this.banner?.dispose();
+    this.menu?.dispose();
+    this.root?.remove();
     removeStyles();
   }
 }

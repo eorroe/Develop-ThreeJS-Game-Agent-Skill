@@ -29,6 +29,7 @@ import {
   EPS,
 } from './math.js';
 import { surfaceIndex, guessSurface, LAYER } from './surfaces.js';
+import { WorkerPool } from '../core/worker-pool.js';
 
 const BINS = 12;
 const LEAF_SIZE = 6;
@@ -42,7 +43,7 @@ const _m4 = new THREE.Matrix4();
 
 export class StaticWorld {
   constructor() {
-    this.objects = []; // { id, name, mesh, surface, mask, tris, triCount, alive, aabb }
+    this.objects = [];
     this._freeIds = [];
 
     this.triCount = 0;
@@ -61,6 +62,7 @@ export class StaticWorld {
     this.dirty = false;
     this.buildMs = 0;
     this.version = 0;
+    this._workerPool = null;
 
     // scratch
     this._cent = new Float32Array(0);
@@ -84,7 +86,6 @@ export class StaticWorld {
       py: new Float32Array(256),
       pz: new Float32Array(256),
       depth: new Float32Array(256),
-      /** Parameter along the query segment where the contact sits, 0..1. */
       s: new Float32Array(256),
       tri: new Int32Array(256),
     };
@@ -93,14 +94,6 @@ export class StaticWorld {
     this.stats = { rayTests: 0, nodeTests: 0, triTests: 0 };
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Registration                                                      */
-  /* ---------------------------------------------------------------- */
-
-  /**
-   * Bake a mesh (or InstancedMesh) into world-space triangles.
-   * Returns the object id, or -1 if the mesh had no usable geometry.
-   */
   addMesh(mesh, surface, mask = LAYER.STATIC, opts = {}) {
     if (!mesh) return -1;
     const baked = bakeMesh(mesh, surface, opts);
@@ -124,7 +117,6 @@ export class StaticWorld {
     return id;
   }
 
-  /** Register raw world-space triangles (Float32Array, 9 floats each). */
   addTriangles(positions, count, surface, mask = LAYER.STATIC, name = 'raw') {
     const id = this._freeIds.length ? this._freeIds.pop() : this.objects.length;
     const s = surfaceIndex(surface);
@@ -159,22 +151,10 @@ export class StaticWorld {
   }
 
   /* ---------------------------------------------------------------- */
-  /* Build                                                             */
+  /* Build & Multi-threaded Worker Integration                        */
   /* ---------------------------------------------------------------- */
 
-  build() {
-    const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
-    let total = 0;
-    for (const o of this.objects) if (o && o.alive) total += o.triCount;
-
-    if (total === 0) {
-      this.triCount = 0;
-      this.nodeCount = 0;
-      this.dirty = false;
-      this.version++;
-      return;
-    }
-
+  _prepareArrays(total) {
     if (this.pos.length < total * 9) {
       this.pos = new Float32Array(total * 9);
       this.nrm = new Float32Array(total * 3);
@@ -203,7 +183,6 @@ export class StaticWorld {
     }
     this.triCount = total;
 
-    // Per-triangle normals, centroids, bounds.
     const cent = this._cent;
     const ta = this._taabb;
     const nrm = this.nrm;
@@ -241,11 +220,86 @@ export class StaticWorld {
     }
     this.aabb.minx = gminx; this.aabb.miny = gminy; this.aabb.minz = gminz;
     this.aabb.maxx = gmaxx; this.aabb.maxy = gmaxy; this.aabb.maxz = gmaxz;
+  }
 
+  build() {
+    const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
+    let total = 0;
+    for (const o of this.objects) if (o && o.alive) total += o.triCount;
+
+    if (total === 0) {
+      this.triCount = 0;
+      this.nodeCount = 0;
+      this.dirty = false;
+      this.version++;
+      return;
+    }
+
+    this._prepareArrays(total);
     this._buildNodes(total);
     this.dirty = false;
     this.version++;
     this.buildMs = (typeof performance !== 'undefined' ? performance.now() : 0) - t0;
+  }
+
+  async buildAsync() {
+    let total = 0;
+    for (const o of this.objects) if (o && o.alive) total += o.triCount;
+
+    if (total === 0) {
+      this.triCount = 0;
+      this.nodeCount = 0;
+      this.dirty = false;
+      this.version++;
+      return;
+    }
+
+    this._prepareArrays(total);
+
+    if (!this._workerPool && typeof Worker !== 'undefined') {
+      try {
+        const workerUrl = new URL('./bvh-worker.js', import.meta.url);
+        this._workerPool = new WorkerPool({ workerUrl, size: 1 });
+      } catch (err) {
+        console.warn('[bvh] WorkerPool initialization skipped:', err);
+      }
+    }
+
+    if (!this._workerPool || !this._workerPool.supported) {
+      this._buildNodes(total);
+      this.dirty = false;
+      this.version++;
+      return;
+    }
+
+    const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
+    try {
+      const centCopy = this._cent.slice();
+      const taabbCopy = this._taabb.slice();
+      const triIndexCopy = this.triIndex.slice();
+      const maxNodes = 2 * total + 8;
+
+      const res = await this._workerPool.dispatch(
+        'build-bvh',
+        { total, cent: centCopy, taabb: taabbCopy, triIndex: triIndexCopy, maxNodes },
+        [centCopy.buffer, taabbCopy.buffer, triIndexCopy.buffer]
+      );
+
+      this.nodeBounds = res.nodeBounds;
+      this.nodeMeta = res.nodeMeta;
+      this.triIndex = res.triIndex;
+      this.nodeCount = res.nodeCount;
+      this.maxDepth = res.maxDepth;
+      this.dirty = false;
+      this.version++;
+      this.buildMs = (typeof performance !== 'undefined' ? performance.now() : 0) - t0;
+      console.info(`[bvh] multi-threaded worker built BVH (${total} tris, ${this.nodeCount} nodes) in ${this.buildMs.toFixed(1)}ms`);
+    } catch (err) {
+      console.warn('[bvh] worker build fallback to sync:', err);
+      this._buildNodes(total);
+      this.dirty = false;
+      this.version++;
+    }
   }
 
   _buildNodes(total) {
@@ -260,14 +314,12 @@ export class StaticWorld {
     meta[1] = total;
     this._nodeBoundsFromRange(0, 0, total);
 
-    // Explicit stack of (nodeIndex, start, count, depth)
     const need = 4 * (2 * Math.ceil(total / LEAF_SIZE) + 64);
     if (this._buildStack.length < need) this._buildStack = new Int32Array(need);
     const stack = this._buildStack;
     let sp = 0;
     stack[sp++] = 0; stack[sp++] = 0; stack[sp++] = total; stack[sp++] = 0;
 
-    // Binned SAH scratch (reused every split)
     const binCount = new Int32Array(BINS);
     const binB = new Float32Array(BINS * 6);
     const leftArea = new Float32Array(BINS);
@@ -283,7 +335,6 @@ export class StaticWorld {
       if (count <= LEAF_SIZE || depth > 60) continue;
 
       const nb = node * 6;
-      // centroid bounds
       let cminx = Infinity, cminy = Infinity, cminz = Infinity;
       let cmaxx = -Infinity, cmaxy = -Infinity, cmaxz = -Infinity;
       for (let i = start; i < start + count; i++) {
@@ -297,7 +348,7 @@ export class StaticWorld {
       let axis = 0, extent = ex, cmin = cminx;
       if (ey > extent) { axis = 1; extent = ey; cmin = cminy; }
       if (ez > extent) { axis = 2; extent = ez; cmin = cminz; }
-      if (extent < 1e-7) continue; // degenerate cluster -> leaf
+      if (extent < 1e-7) continue;
 
       const scale = BINS / extent;
       binCount.fill(0);
@@ -320,7 +371,6 @@ export class StaticWorld {
         if (ta[tb + 5] > binB[o + 5]) binB[o + 5] = ta[tb + 5];
       }
 
-      // sweep left
       let axmin = Infinity, aymin = Infinity, azmin = Infinity;
       let axmax = -Infinity, aymax = -Infinity, azmax = -Infinity;
       let acc = 0;
@@ -338,11 +388,11 @@ export class StaticWorld {
         leftCnt[b] = acc;
         leftArea[b] = acc > 0 ? surfaceArea(axmin, aymin, azmin, axmax, aymax, azmax) : 0;
       }
-      // sweep right + pick
+
       axmin = aymin = azmin = Infinity;
       axmax = aymax = azmax = -Infinity;
       let rAcc = 0;
-      let bestCost = TRI_COST * count; // cost of making this a leaf
+      let bestCost = TRI_COST * count;
       let bestSplit = -1;
       const parentArea = surfaceArea(
         bounds[nb], bounds[nb + 1], bounds[nb + 2],
@@ -369,9 +419,8 @@ export class StaticWorld {
           bestSplit = b;
         }
       }
-      if (bestSplit < 0) continue; // leaf is cheaper
+      if (bestSplit < 0) continue;
 
-      // partition in place
       const splitPos = cmin + extent * (bestSplit / BINS);
       let i = start, j = start + count - 1;
       while (i <= j) {
@@ -416,8 +465,6 @@ export class StaticWorld {
       if (ta[b + 4] > mxy) mxy = ta[b + 4];
       if (ta[b + 5] > mxz) mxz = ta[b + 5];
     }
-    // Float32 storage can round a bound inwards; pad by a hair so we never
-    // reject a triangle that actually straddles the plane.
     const p = 1e-5;
     const o = node * 6;
     this.nodeBounds[o] = mnx - p;
@@ -432,11 +479,6 @@ export class StaticWorld {
   /* Queries                                                           */
   /* ---------------------------------------------------------------- */
 
-  /**
-   * Closest-hit ray query. `out` is a hit record (see math.makeHitRecord).
-   * Returns true on hit. Both faces are tested — bullet penetration needs the
-   * backface exit hit.
-   */
   raycast(ox, oy, oz, dx, dy, dz, maxDist, mask, out, ignoreObject = -1) {
     out.hit = false;
     if (this.nodeCount === 0 || this.triCount === 0) return false;
@@ -485,7 +527,7 @@ export class StaticWorld {
             if (t >= 0 && t < best) {
               best = t;
               bestTri = tri;
-              bestFront = out.frontFace; // written by rayTriangle
+              bestFront = out.frontFace;
             }
           }
           break;
@@ -509,8 +551,6 @@ export class StaticWorld {
     if (bestTri < 0) return false;
     this._fillHit(out, bestTri, best, ox, oy, oz, dx, dy, dz);
     out.frontFace = bestFront;
-    // Face the normal against the incoming ray so callers can always use it
-    // directly for reflection / decal orientation.
     if (out.nx * dx + out.ny * dy + out.nz * dz > 0) {
       out.nx = -out.nx; out.ny = -out.ny; out.nz = -out.nz;
     }
@@ -532,7 +572,6 @@ export class StaticWorld {
     out.body = null;
   }
 
-  /** Any-hit shadow/visibility ray. Cheaper: no ordering, first hit wins. */
   raycastAny(ox, oy, oz, dx, dy, dz, maxDist, mask) {
     if (this.nodeCount === 0) return false;
     const ix = 1 / (dx !== 0 ? dx : 1e-30);
@@ -578,7 +617,6 @@ export class StaticWorld {
     return false;
   }
 
-  /** Gather triangle indices whose AABB overlaps the query box. */
   queryAabb(minx, miny, minz, maxx, maxy, maxz, mask) {
     this._candCount = 0;
     if (this.nodeCount === 0) return 0;
@@ -621,7 +659,7 @@ export class StaticWorld {
       const hitR = !(nb[ro] > maxx || nb[ro + 3] < minx || nb[ro + 1] > maxy || nb[ro + 4] < miny || nb[ro + 2] > maxz || nb[ro + 5] < minz);
       if (hitL) stack[sp++] = l;
       if (hitR) stack[sp++] = r;
-      if (sp >= stack.length - 2) break; // stack is sized from tree depth; never hit in practice
+      if (sp >= stack.length - 2) break;
     }
     this._candCount = n;
     return n;
@@ -634,12 +672,6 @@ export class StaticWorld {
     return this._candCount;
   }
 
-  /**
-   * Swept capsule against the static world. The capsule translates linearly;
-   * per candidate triangle we run conservative advancement on the exact
-   * segment/triangle distance function, which is convex under linear motion —
-   * so the result is a true time of impact with no tunnelling at any speed.
-   */
   sweepCapsule(p0x, p0y, p0z, p1x, p1y, p1z, radius, dx, dy, dz, maxDist, mask, out) {
     out.hit = false;
     if (this.nodeCount === 0) return false;
@@ -670,8 +702,6 @@ export class StaticWorld {
       const bx = pos[p + 3], by = pos[p + 4], bz = pos[p + 5];
       const cx = pos[p + 6], cy = pos[p + 7], cz = pos[p + 8];
 
-      // Cheap plane-slab prefilter. The min signed distance over the capsule
-      // axis is linear in t, so the whole sweep can be rejected with two dots.
       const tnx = nrm[tri * 3], tny = nrm[tri * 3 + 1], tnz = nrm[tri * 3 + 2];
       const sdA = (p0x - ax) * tnx + (p0y - ay) * tny + (p0z - az) * tnz;
       const sdB = (p1x - ax) * tnx + (p1y - ay) * tny + (p1z - az) * tnz;
@@ -691,27 +721,22 @@ export class StaticWorld {
           cl
         );
         const dist = Math.sqrt(cl.d2) - radius;
-        // separating axis: capsule axis point -> triangle point
         let sx = cl.bx - cl.ax, sy = cl.by - cl.ay, sz = cl.bz - cl.az;
         const sl = Math.hypot(sx, sy, sz);
-        if (sl < 1e-12) { hitT = t; break; } // axis passes through the face
+        if (sl < 1e-12) { hitT = t; break; }
         sx /= sl; sy /= sl; sz /= sl;
         const closing = dx * sx + dy * sy + dz * sz;
         if (dist <= CA_TOL) {
-          // Already touching. Only a *blocking* contact counts — a capsule
-          // resting on the floor must still be able to slide along it, or the
-          // controller stalls the instant it stands on anything.
           if (closing > 1e-6) hitT = t;
           break;
         }
-        if (closing <= 1e-7) break; // convex distance is non-decreasing -> miss
+        if (closing <= 1e-7) break;
         const step = dist / closing;
         t += step > 1e-7 ? step : 1e-7;
         if (t >= best) break;
       }
       if (hitT < 0 || hitT >= best) continue;
 
-      // Recover the contact normal at the impact configuration.
       const ox = dx * hitT, oy = dy * hitT, oz = dz * hitT;
       segTriangleClosest(
         p0x + ox, p0y + oy, p0z + oz,
@@ -723,7 +748,6 @@ export class StaticWorld {
       const nl = Math.hypot(nx, ny, nz);
       if (nl > 1e-7) { nx /= nl; ny /= nl; nz /= nl; }
       else { nx = tnx; ny = tny; nz = tnz; }
-      // Never return a normal we are travelling away from.
       if (nx * dx + ny * dy + nz * dz > 0) {
         if (tnx * dx + tny * dy + tnz * dz < 0) { nx = tnx; ny = tny; nz = tnz; }
         else { nx = -tnx; ny = -tny; nz = -tnz; }
@@ -747,11 +771,6 @@ export class StaticWorld {
     return true;
   }
 
-  /**
-   * Collect penetration contacts for a capsule at rest. Fills `this.contacts`
-   * (shared, valid until the next overlap query). Normals point out of the
-   * surface, towards the capsule.
-   */
   overlapCapsule(p0x, p0y, p0z, p1x, p1y, p1z, radius, mask, margin = 0) {
     const cts = this.contacts;
     cts.count = 0;
@@ -786,8 +805,6 @@ export class StaticWorld {
         nx = (cl.ax - cl.bx) / d;
         ny = (cl.ay - cl.by) / d;
         nz = (cl.az - cl.bz) / d;
-        // Deep contacts can pick a normal pointing into the solid; fall back to
-        // the face normal when the closest-point direction disagrees with it.
         const fn = nx * nrm[tri * 3] + ny * nrm[tri * 3 + 1] + nz * nrm[tri * 3 + 2];
         if (fn < 0.05) {
           nx = nrm[tri * 3]; ny = nrm[tri * 3 + 1]; nz = nrm[tri * 3 + 2];
@@ -815,6 +832,10 @@ export class StaticWorld {
   }
 
   dispose() {
+    if (this._workerPool) {
+      this._workerPool.dispose();
+      this._workerPool = null;
+    }
     this.objects.length = 0;
     this.pos = new Float32Array(0);
     this.nodeCount = 0;
@@ -832,11 +853,6 @@ function surfaceArea(minx, miny, minz, maxx, maxy, maxz) {
 /* Mesh baking                                                         */
 /* ------------------------------------------------------------------ */
 
-/**
- * Flatten a Mesh / InstancedMesh into world-space triangles.
- * Handles indexed and non-indexed geometry, multi-material groups (each group
- * can carry its own surface, inferred from the material name), and instancing.
- */
 export function bakeMesh(mesh, surfaceOverride, opts = {}) {
   const geo = mesh.geometry;
   if (!geo || !geo.attributes || !geo.attributes.position) return null;
@@ -854,7 +870,6 @@ export function bakeMesh(mesh, surfaceOverride, opts = {}) {
 
   mesh.updateWorldMatrix(true, false);
 
-  // Per-group surface resolution.
   const groups = geo.groups && geo.groups.length ? geo.groups : null;
   const baseSurface = surfaceOverride !== undefined && surfaceOverride !== null
     ? surfaceIndex(surfaceOverride)
@@ -906,7 +921,6 @@ export function bakeMesh(mesh, surfaceOverride, opts = {}) {
     }
   }
 
-  // Drop degenerate triangles (zero area) — they poison normals and SAH bins.
   let w = 0;
   for (let t = 0; t < total; t++) {
     const p = t * 9;
